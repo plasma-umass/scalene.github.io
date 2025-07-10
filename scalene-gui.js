@@ -1,6 +1,20 @@
-/// <reference types="aws-sdk" />
+import { Buffer } from "buffer";
+window.Buffer = Buffer;
+import vegaEmbed from 'vega-embed';
 
-function vsNavigate(filename, lineno) {
+import { Prism } from "./prism";
+import Tablesort from "./tablesort";
+import { proposeOptimization } from "./optimizations";
+import { unescapeUnicode, memory_consumed_str, time_consumed_str } from "./utils";
+import { makeBar, makeGPUPie, makeMemoryPie, makeMemoryBar, makeSparkline,
+	 Lightning, Explosion, RightTriangle, DownTriangle, WhiteLightning, WhiteExplosion} from "./gui-elements";
+import { checkApiKey } from "./openai";
+import { fetchModelNames } from "./ollama";
+import { observeDOM, processPersistentElements } from "./persistence";
+
+window.checkApiKey = checkApiKey;
+
+export function vsNavigate(filename, lineno) {
   // If we are in VS Code, clicking on a line number in Scalene's web UI will navigate to that line in the source code.
   try {
     const vscode = acquireVsCodeApi();
@@ -9,651 +23,16 @@ function vsNavigate(filename, lineno) {
       filePath: filename,
       lineNumber: lineno,
     });
-  } catch {}
+  } catch {
+    // Do nothing
+  }
 }
 
-function generateScaleneOptimizedCodeRequest(
-  context,
-  sourceCode,
-  line,
-  recommendedLibraries = [],
-  includeGpuOptimizations = false,
-) {
-  // Default high-performance libraries known for their efficiency
-  const defaultLibraries = [
-    "NumPy",
-    "Scikit-learn",
-    "Pandas",
-    "TensorFlow",
-    "PyTorch",
-  ];
-  const highPerformanceLibraries = [
-    ...new Set([...defaultLibraries, ...recommendedLibraries]),
-  ];
-
-  let promptParts = [
-    "Optimize the following Python code to make it more efficient WITHOUT CHANGING ITS RESULTS.\n\n",
-    context.trim(),
-    "\n# Start of code\n",
-    sourceCode.trim(),
-    "\n# End of code\n\n",
-    "Rewrite the above Python code from 'Start of code' to 'End of code', aiming for clear and simple optimizations. ",
-    "Your output should consist only of valid Python code, with brief explanatory comments prefaced with #. ",
-    "Include a detailed explanatory comment before the code, starting with '# Proposed optimization:'. ",
-    "Leverage high-performance native libraries, especially those utilizing GPU, for significant performance improvements. ",
-    "Consider using the following other libraries, if appropriate:\n",
-    highPerformanceLibraries.map((e) => "  import " + e).join("\n") + "\n",
-    "Eliminate as many for loops, while loops, and list or dict comprehensions as possible, replacing them with vectorized equivalents. ",
-    //    "Consider GPU utilization, memory consumption, and copy volume when using GPU-accelerated libraries. ",
-    //    "Low GPU utilization and high copy volume indicate inefficient use of such libraries. ",
-    "Quantify the expected speedup in terms of orders of magnitude if possible. ",
-    "Fix any errors in the optimized code. ",
-    //    "Consider the peak amount of memory used per line and CPU utilization for targeted optimization. ",
-    //    "Note on CPU utilization: Low utilization in libraries known for multi-threading/multi-processing indicates inefficiency.\n\n",
-  ];
-
-  // Conditional inclusion of GPU optimizations
-  if (includeGpuOptimizations) {
-    promptParts.push(
-      "Use GPU-accelerated libraries whenever it would substantially increase performance. ",
-    );
-  }
-
-  // Performance Insights
-  promptParts.push(
-    "Consider the following insights gathered from the Scalene profiler for optimization:\n",
-  );
-  const total_cpu_percent =
-    line.n_cpu_percent_python + line.n_cpu_percent_c + line.n_sys_percent;
-
-  promptParts.push(
-    `- CPU time: percent spent in the Python interpreter: ${((100 * line.n_cpu_percent_python) / total_cpu_percent).toFixed(2)}%\n`,
-  );
-  promptParts.push(
-    `- CPU time: percent spent executing native code: ${((100 * line.n_cpu_percent_c) / total_cpu_percent).toFixed(2)}%\n`,
-  );
-  promptParts.push(
-    `- CPU time: percent of system time: ${((100 * line.n_sys_percent) / total_cpu_percent).toFixed(2)}%\n`,
-  );
-  // `- CPU utilization: ${performanceMetrics.cpu_utilization}. Low utilization with high-core count might indicate inefficient use of multi-threaded/multi-process libraries.\n`,
-  promptParts.push(
-    `- Core utilization: ${((100 * line.n_core_utilization) / total_cpu_percent).toFixed(2)}%\n`,
-  );
-  //      `- Peak memory per line: Focus on lines with high memory usage, specifically ${performanceMetrics.peak_memory_per_line}.\n`,
-  promptParts.push(
-    `- Peak memory usage: ${line.n_peak_mb.toFixed(0)}MB (${(100 * line.n_python_fraction).toFixed(2)}% Python memory)\n`,
-  );
-  //      `- Copy volume: ${performanceMetrics.copy_volume} MB. High volume indicates inefficient data handling with GPU libraries.\n`,
-  if (line.n_copy_mb_s > 1) {
-    promptParts.push(
-      `- Megabytes copied per second by memcpy/strcpy: ${line.n_copy_mb_s.toFixed(2)}\n`,
-    );
-  }
-  if (includeGpuOptimizations) {
-    // `  - GPU utilization: ${performanceMetrics.gpu_utilization}%. Low utilization indicates potential inefficiencies in GPU-accelerated library use.\n`
-    promptParts.push(
-      `- GPU percent utilization: ${(100 * line.n_gpu_percent).toFixed(2)}%\n`,
-    );
-    // `  - GPU memory usage: ${performanceMetrics.gpu_memory} MB. Optimize to reduce unnecessary GPU memory consumption.\n`
-    // TODO GPU memory
-  }
-  promptParts.push(`Optimized code:`);
-  return promptParts.join("");
-}
-
-const recommendedLibraries = ["Cython", "Dask"]; // Add any domain-specific libraries here
-
-// const prompt = generateScaleneOptimizedCodeRequest(context, sourceCode, line, recommendedLibraries, true);
-
-function extractPythonCodeBlock(markdown) {
-  // Pattern to match code blocks optionally tagged with "python"
-  // - ``` optionally followed by "python"
-  // - Non-greedy match for any characters (including new lines) between the backticks
-  // - Flags:
-  //   - 'g' for global search to find all matches
-  //   - 's' to allow '.' to match newline characters
-  const pattern = /```python\s*([\s\S]*?)```|```([\s\S]*?)```/g;
-
-  let match;
-  let extractedCode = "";
-  // Use a loop to find all matches
-  while ((match = pattern.exec(markdown)) !== null) {
-    // Check which group matched. Group 1 is for explicitly tagged Python code, group 2 for any code block
-    const codeBlock = match[1] ? match[1] : match[2];
-    // Concatenate the extracted code blocks, separated by new lines if there's more than one block
-    if (extractedCode && codeBlock) extractedCode += "\n\n";
-    extractedCode += codeBlock;
-  }
-
-  return extractedCode;
-}
-
-const RightTriangle = "&#9658"; // right-facing triangle symbol (collapsed view)
-const DownTriangle = "&#9660"; // downward-facing triangle symbol (expanded view)
-const Lightning = "&#9889;"; // lightning bolt (for optimizing a line)
-const Explosion = "&#128165;"; // explosion (for optimizing a region)
-const WhiteLightning = `<span style="opacity:0">${Lightning}</span>`; // invisible but same width as lightning bolt
-const WhiteExplosion = `<span style="opacity:0">${Explosion}</span>`; // invisible but same width as lightning bolt
 const maxLinesPerRegion = 50; // Only show regions that are no more than this many lines.
 
 let showedExplosion = {}; // Used so we only show one explosion per region.
 
-function unescapeUnicode(s) {
-  return s.replace(/\\u([\dA-F]{4})/gi, function (match, p1) {
-    return String.fromCharCode(parseInt(p1, 16));
-  });
-}
-
-async function tryApi(apiKey) {
-  const response = await fetch("https://api.openai.com/v1/completions", {
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-  });
-  return response;
-}
-
-async function isValidApiKey(apiKey) {
-  const response = await tryApi(apiKey);
-  const data = await response.json();
-  if (
-    data.error &&
-    data.error.code in
-      {
-        invalid_api_key: true,
-        invalid_request_error: true,
-        model_not_found: true,
-        insufficient_quota: true,
-      }
-  ) {
-    return false;
-  } else {
-    return true;
-  }
-}
-
-function checkApiKey(apiKey) {
-  (async () => {
-    try {
-      window.localStorage.setItem("scalene-api-key", apiKey);
-    } catch {}
-    // If the API key is empty, clear the status indicator.
-    if (apiKey.length === 0) {
-      document.getElementById("valid-api-key").innerHTML = "";
-      return;
-    }
-    const isValid = await isValidApiKey(apiKey);
-    if (!isValid) {
-      document.getElementById("valid-api-key").innerHTML = "&#10005;";
-    } else {
-      document.getElementById("valid-api-key").innerHTML = "&check;";
-    }
-  })();
-}
-
-function extractCode(text) {
-  /**
-   * Extracts code block from the given completion text.
-   *
-   * @param {string} text - A string containing text and other data.
-   * @returns {string} Extracted code block from the completion object.
-   */
-  if (!text) {
-    return text;
-  }
-  const lines = text.split("\n");
-  let i = 0;
-  while (i < lines.length && lines[i].trim() === "") {
-    i++;
-  }
-  const first_line = lines[i].trim();
-  let code_block;
-  if (first_line === "```") {
-    code_block = text.slice(3);
-  } else if (first_line.startsWith("```")) {
-    const word = first_line.slice(3).trim();
-    if (word.length > 0 && !word.includes(" ")) {
-      code_block = text.slice(first_line.length);
-    } else {
-      code_block = text;
-    }
-  } else {
-    code_block = text;
-  }
-  const end_index = code_block.indexOf("```");
-  if (end_index !== -1) {
-    code_block = code_block.slice(0, end_index);
-  }
-  return code_block;
-}
-
-async function sendPromptToOpenAI(prompt, len, apiKey) {
-  const endpoint = "https://api.openai.com/v1/chat/completions";
-  const model = document.getElementById("language-model-openai").value;
-
-  const body = JSON.stringify({
-    model: model,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a Python programming assistant who ONLY responds with blocks of commented, optimized code. You never respond with text. Just code, starting with ``` and ending with ```.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    user: "scalene-user",
-  });
-
-  console.log(body);
-
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: body,
-  });
-
-  const data = await response.json();
-  if (data.error) {
-    if (
-      data.error.code in
-      {
-        invalid_request_error: true,
-        model_not_found: true,
-        insufficient_quota: true,
-      }
-    ) {
-      if (data.error.code === "model_not_found" && model === "gpt-4") {
-        // Technically, model_not_found applies only for GPT-4.0
-        // if an account has not been funded with at least $1.
-        alert(
-          "You either need to add funds to your OpenAI account to use this feature, or you need to switch to GPT-3.5 if you are using free credits.",
-        );
-      } else {
-        alert(
-          "You need to add funds to your OpenAI account to use this feature.",
-        );
-      }
-      return "";
-    }
-  }
-  try {
-    console.log(
-      `Debugging info: Retrieved ${JSON.stringify(data.choices[0], null, 4)}`,
-    );
-  } catch {
-    console.log(
-      `Debugging info: Failed to retrieve data.choices from the server. data = ${JSON.stringify(
-        data,
-      )}`,
-    );
-  }
-
-  try {
-    return data.choices[0].message.content.replace(/^\s*[\r\n]/gm, "");
-  } catch {
-    // return "# Query failed. See JavaScript console (in Chrome: View > Developer > JavaScript Console) for more info.\n";
-    return "# Query failed. See JavaScript console (in Chrome: View > Developer > JavaScript Console) for more info.\n";
-  }
-}
-
-async function sendPromptToAzureOpenAI(prompt, len, apiKey, apiUrl, aiModel) {
-  const apiVersion = document.getElementById("azure-api-model-version").value;
-  const endpoint = `${apiUrl}/openai/deployments/${aiModel}/chat/completions?api-version=${apiVersion}`;
-
-  const body = JSON.stringify({
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a Python programming assistant who ONLY responds with blocks of commented, optimized code. You never respond with text. Just code, starting with ``` and ending with ```.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    user: "scalene-user",
-  });
-
-  console.log(body);
-
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "api-key": apiKey,
-    },
-    body: body,
-  });
-
-  const data = await response.json();
-  if (data.error) {
-    if (
-      data.error.code in
-      {
-        invalid_request_error: true,
-        model_not_found: true,
-        insufficient_quota: true,
-      }
-    ) {
-      return "";
-    }
-  }
-  try {
-    console.log(
-      `Debugging info: Retrieved ${JSON.stringify(data.choices[0], null, 4)}`,
-    );
-  } catch {
-    console.log(
-      `Debugging info: Failed to retrieve data.choices from the server. data = ${JSON.stringify(
-        data,
-      )}`,
-    );
-  }
-
-  try {
-    return data.choices[0].message.content.replace(/^\s*[\r\n]/gm, "");
-  } catch {
-    // return "# Query failed. See JavaScript console (in Chrome: View > Developer > JavaScript Console) for more info.\n";
-    return "# Query failed. See JavaScript console (in Chrome: View > Developer > JavaScript Console) for more info.\n";
-  }
-}
-
-async function sendPromptToAmazon(prompt, len) {
-  const serviceName = "bedrock";
-  const region = "us-west-2";
-  const modelId = "anthropic.claude-v2";
-  const endpoint = `https://${serviceName}-runtime.${region}.amazonaws.com/model/${modelId}/invoke`;
-  // const model = document.getElementById('language-model-amazon').value;
-
-  const body = JSON.stringify({
-    prompt: `Human: ${prompt}\n\nAssistant:\n`,
-    max_tokens_to_sample: 2048,
-    temperature: 0,
-    top_k: 250,
-    top_p: 1,
-    stop_sequences: ["\n\nHuman:"],
-    anthropic_version: "bedrock-2023-05-31",
-  });
-
-  console.log(body);
-
-  var bedrockruntime = new AWS.BedrockRuntime();
-  bedrockruntime.invokeModel(body, function (err, data) {
-    if (err)
-      console.log(err, err.stack); // an error occurred
-    else console.log(data); // successful response
-  });
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      //	    Authorization: `Bearer ${apiKey}`,
-    },
-    body: body,
-  });
-
-  const data = await response.json();
-  console.log(data);
-  try {
-    console.log(
-      `Debugging info: Retrieved ${JSON.stringify(data.choices[0], null, 4)}`,
-    );
-  } catch {
-    console.log(
-      `Debugging info: Failed to retrieve data.choices from the server. data = ${JSON.stringify(
-        data,
-      )}`,
-    );
-  }
-
-  try {
-    return data.choices[0].message.content.replace(/^\s*[\r\n]/gm, "");
-  } catch {
-    // return "# Query failed. See JavaScript console (in Chrome: View > Developer > JavaScript Console) for more info.\n";
-    return "# Query failed. See JavaScript console (in Chrome: View > Developer > JavaScript Console) for more info.\n";
-  }
-}
-
-async function sendPromptToOllama(prompt, len, model, ipAddr, portNum) {
-  const url = `http://${ipAddr}:${portNum}/api/chat`;
-  const headers = { "Content-Type": "application/json" };
-  const body = JSON.stringify({
-    model: model,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are an expert code assistant who only responds in Python code.", //You are a Python programming assistant who ONLY responds with blocks of commented, optimized code. You never respond with text. Just code, in a JSON object with the key "code".'
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    stream: false,
-    //	format: "json",
-    temperature: 0.3,
-    frequency_penalty: 0,
-    presence_penalty: 0,
-    user: "scalene-user",
-  });
-
-  console.log(body);
-
-  let done = false;
-  let responseAggregated = "";
-  let retried = 0;
-  const retries = 3;
-
-  while (!done) {
-    if (retried >= retries) {
-      return {};
-    }
-
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: headers,
-        body: body,
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const text = await response.text();
-      const responses = text.split("\n");
-      for (const resp of responses) {
-        const responseJson = JSON.parse(resp);
-        if (responseJson.message && responseJson.message.content) {
-          responseAggregated += responseJson.message.content;
-        }
-
-        if (responseJson.done) {
-          done = true;
-          break;
-        }
-      }
-    } catch (error) {
-      console.log(`Error: ${error}`);
-      retried++;
-    }
-  }
-
-  console.log(responseAggregated);
-  try {
-    return responseAggregated; // data.choices[0].message.content.replace(/^\s*[\r\n]/gm, "");
-  } catch {
-    // return "# Query failed. See JavaScript console (in Chrome: View > Developer > JavaScript Console) for more info.\n";
-    return "# Query failed. See JavaScript console (in Chrome: View > Developer > JavaScript Console) for more info.\n";
-  }
-}
-
-function countSpaces(str) {
-  // Use a regular expression to match any whitespace character at the start of the string
-  const match = str.match(/^\s+/);
-
-  // If there was a match, return the length of the match
-  if (match) {
-    return match[0].length;
-  }
-
-  // Otherwise, return 0
-  return 0;
-}
-
-async function optimizeCode(imports, code, line, context) {
-  // Tailor prompt to request GPU optimizations or not.
-  const useGPUs = document.getElementById("use-gpu-checkbox").checked; // globalThis.profile.gpu;
-
-  let recommendedLibraries = ["sklearn"];
-  if (useGPUs) {
-    // Suggest cupy if we are using the GPU.
-    recommendedLibraries.push("cupy");
-  } else {
-    // Suggest numpy otherwise.
-    recommendedLibraries.push("numpy");
-  }
-  // TODO: remove anything already imported in imports
-
-  const bigPrompt = generateScaleneOptimizedCodeRequest(
-    context,
-    code,
-    line,
-    recommendedLibraries,
-    useGPUs,
-  );
-
-  const useGPUstring = useGPUs ? " or the GPU " : " ";
-  // Check for a valid API key.
-  // TODO: Add checks for Amazon / local
-  let apiKey = "";
-  let aiService = document.getElementById("service-select").value;
-  if (aiService === "openai") {
-    apiKey = document.getElementById("api-key").value;
-  } else if (aiService === "azure-openai") {
-    apiKey = document.getElementById("azure-api-key").value;
-  }
-
-  if ((aiService === "openai" || aiService === "azure-openai") && !apiKey) {
-    alert(
-      "To activate proposed optimizations, enter an OpenAI API key in AI optimization options.",
-    );
-    document.getElementById("ai-optimization-options").open = true;
-    return "";
-  }
-  // If the code to be optimized is just one line of code, say so.
-  let lineOf = " ";
-  if (code.split("\n").length <= 2) {
-    lineOf = " line of ";
-  }
-
-  let libraries = "import sklearn";
-  if (useGPUs) {
-    // Suggest cupy if we are using the GPU.
-    libraries += "\nimport cupy";
-  } else {
-    // Suggest numpy otherwise.
-    libraries += "\nimport numpy as np";
-  }
-
-  // Construct the prompt.
-
-  const optimizePerformancePrompt = `Optimize the following${lineOf}Python code:\n\n${context}\n\n# Start of code\n\n${code}\n\n# End of code\n\nRewrite the above Python code only from "Start of code" to "End of code", to make it more efficient WITHOUT CHANGING ITS RESULTS. Assume the code has already executed all these imports; do NOT include them in the optimized code:\n\n${imports}\n\nUse native libraries if that would make it faster than pure Python. Consider using the following other libraries, if appropriate:\n\n${libraries}\n\nYour output should only consist of valid Python code. Output the resulting Python with brief explanations only included as comments prefaced with #. Include a detailed explanatory comment before the code, starting with the text "# Proposed optimization:". Make the code as clear and simple as possible, while also making it as fast and memory-efficient as possible. Use vectorized operations${useGPUstring}whenever it would substantially increase performance, and quantify the speedup in terms of orders of magnitude. Eliminate as many for loops, while loops, and list or dict comprehensions as possible, replacing them with vectorized equivalents. If the performance is not likely to increase, leave the code unchanged. Fix any errors in the optimized code. Optimized${lineOf}code:`;
-
-  const context_ollama = "";
-  const optimizePerformancePrompt_ollama_prev = `Optimize the following${lineOf}Python code:\n\n${context_ollama}\n\n# Start of code\n\n${code}\n\n# End of code\n\nRewrite the above Python code only from "Start of code" to "End of code", to make it more efficient WITHOUT CHANGING ITS RESULTS. Only output your result in JSON, with the optimized code in "code". Optimized${lineOf}code:`;
-
-  const optimizePerformancePrompt_ollama_pp = `Rewrite the following Python code to make it run faster. Use vectorization if possible, eliminating as many loops as possible. Try to reduce computational complexity of operations. Only output the optimized code in JSON with the key 'code'. Original code: ${code}. Optimized code:`;
-
-  // TODO parameterize based on CPU utilization, Python vs. C time, GPU choice, memory efficiency.
-  const optimizePerformancePrompt_ollama = `# Original code\n${code}\n\n# This code is an optimized version of the original code that dramatically improves its performance. Whenever possible, the code has been changed to use native libraries and vectorization, and data structures like lists have been replaced by sets or dicts. Do not change any function names. Optimized code:\n`;
-
-  const pure_optimizePerformancePrompt = `Optimize the following${lineOf}Python code:\n\n${context}\n\n# Start of code\n\n${code}\n\n# End of code\n\nRewrite the above Python code only from "Start of code" to "End of code", to make it more efficient WITHOUT CHANGING ITS RESULTS. Assume the code has already executed all these imports; do NOT include them in the optimized code:\n\n${imports}\n\nONLY USE PURE PYTHON.\n\nYour output should only consist of valid Python code. Output the resulting Python with brief explanations only included as comments prefaced with #. Include a detailed explanatory comment before the code, starting with the text "# Proposed optimization:". Make the code as clear and simple as possible, while also making it as fast and memory-efficient as possible. If the performance is not likely to increase, leave the code unchanged. Fix any errors in the optimized code. Optimized${lineOf}code:`;
-
-  const memoryEfficiencyPrompt = `Optimize the following${lineOf} Python code:\n\n${context}\n\n# Start of code\n\n${code}\n\n\n# End of code\n\nRewrite the above Python code only from "Start of code" to "End of code", to make it more memory-efficient WITHOUT CHANGING ITS RESULTS. Assume the code has already executed all these imports; do NOT include them in the optimized code:\n\n${imports}\n\nUse native libraries if that would make it more space efficient than pure Python. Consider using the following other libraries, if appropriate:\n\n${libraries}\n\nYour output should only consist of valid Python code. Output the resulting Python with brief explanations only included as comments prefaced with #. Include a detailed explanatory comment before the code, starting with the text "# Proposed optimization:". Make the code as clear and simple as possible, while also making it as fast and memory-efficient as possible. Use native libraries whenever possible to reduce memory consumption; invoke del on variables and array elements as soon as it is safe to do so. If the memory consumption is not likely to be reduced, leave the code unchanged. Fix any errors in the optimized code. Optimized${lineOf}code:`;
-
-  const optimizePerf = document.getElementById("optimize-performance").checked;
-
-  let prompt;
-  if (optimizePerf) {
-    prompt = optimizePerformancePrompt;
-  } else {
-    prompt = memoryEfficiencyPrompt;
-  }
-
-  // Just use big prompt maybe FIXME
-  prompt = bigPrompt;
-
-  // Use number of words in the original code as a proxy for the number of tokens.
-  const numWords = code.match(/\b\w+\b/g).length;
-
-  switch (document.getElementById("service-select").value) {
-    case "openai": {
-      console.log(prompt);
-      const result = await sendPromptToOpenAI(
-        prompt,
-        Math.max(numWords * 4, 500),
-        apiKey,
-      );
-      return extractCode(result);
-    }
-    case "local": {
-      console.log("Running " + document.getElementById("service-select").value);
-      console.log(prompt);
-      //      console.log(optimizePerformancePrompt_ollama);
-      const result = await sendPromptToOllama(
-        prompt, // optimizePerformancePrompt_ollama,
-        Math.max(numWords * 4, 500),
-        document.getElementById("language-model-local").value,
-        document.getElementById("local-ip").value,
-        document.getElementById("local-port").value,
-      );
-      if (result.includes("```")) {
-        return extractPythonCodeBlock(result);
-      } else {
-        return result;
-      }
-    }
-    case "amazon": {
-      console.log("Running " + document.getElementById("service-select").value);
-      console.log(prompt); // optimizePerformancePrompt_ollama);
-      const result = await sendPromptToAmazon(
-        prompt, // optimizePerformancePrompt_ollama,
-        Math.max(numWords * 4, 500),
-      );
-      console.log(
-        document.getElementById("service-select").value + " not yet supported.",
-      );
-      return "";
-    }
-    case "azure-openai": {
-      console.log("Running " + document.getElementById("service-select").value);
-      console.log(prompt);
-      let azureOpenAiEndpoint = document.getElementById("azure-api-url").value;
-      let azureOpenAiModel = document.getElementById("azure-api-model").value;
-      const result = await sendPromptToAzureOpenAI(
-        prompt,
-        Math.max(numWords * 4, 500),
-        apiKey,
-        azureOpenAiEndpoint,
-        azureOpenAiModel,
-      );
-      return extractCode(result);
-    }
-  }
-}
-
-function proposeOptimizationRegion(filename, file_number, line) {
+export function proposeOptimizationRegion(filename, file_number, line) {
   proposeOptimization(
     filename,
     file_number,
@@ -662,7 +41,7 @@ function proposeOptimizationRegion(filename, file_number, line) {
   );
 }
 
-function proposeOptimizationLine(filename, file_number, line) {
+export function proposeOptimizationLine(filename, file_number, line) {
   proposeOptimization(
     filename,
     file_number,
@@ -671,582 +50,73 @@ function proposeOptimizationLine(filename, file_number, line) {
   );
 }
 
-function proposeOptimization(filename, file_number, line, params) {
-  filename = unescape(filename);
-  const useRegion = params["regions"];
-  const prof = globalThis.profile;
-  const this_file = prof.files[filename].lines;
-  const imports = prof.files[filename].imports.join("\n");
-  const start_region_line = this_file[line.lineno - 1]["start_region_line"];
-  const end_region_line = this_file[line.lineno - 1]["end_region_line"];
-  let context;
-  const code_line = this_file[line.lineno - 1]["line"];
-  let code_region;
-  if (useRegion) {
-    code_region = this_file
-      .slice(start_region_line - 1, end_region_line)
-      .map((e) => e["line"])
-      .join("");
-    context = this_file
-      .slice(
-        Math.max(0, start_region_line - 10),
-        Math.min(start_region_line - 1, this_file.length),
-      )
-      .map((e) => e["line"])
-      .join("");
-  } else {
-    code_region = code_line;
-    context = this_file
-      .slice(
-        Math.max(0, line.lineno - 10),
-        Math.min(line.lineno - 1, this_file.length),
-      )
-      .map((e) => e["line"])
-      .join("");
-  }
-  // Count the number of leading spaces to match indentation level on output
-  let leadingSpaceCount = countSpaces(code_line) + 3; // including the lightning bolt and explosion
-  let indent =
-    WhiteLightning + WhiteExplosion + "&nbsp;".repeat(leadingSpaceCount - 1);
-  const elt = document.getElementById(`code-${file_number}-${line.lineno}`);
-  (async () => {
-    // TODO: check Amazon credentials
-    const service = document.getElementById("service-select").value;
-    if (service === "openai") {
-      const isValid = await isValidApiKey(
-        document.getElementById("api-key").value,
-      );
-      if (!isValid) {
-        alert(
-          "You must enter a valid OpenAI API key to activate proposed optimizations.",
-        );
-        document.getElementById("ai-optimization-options").open = true;
-        return;
-      }
-    }
-    if (service == "local") {
-      if (
-        document.getElementById("local-models-list").style.display === "none"
-      ) {
-        // No service was found.
-        alert(
-          "You must be connected to a running Ollama server to activate proposed optimizations.",
-        );
-        document.getElementById("ai-optimization-options").open = true;
-        return;
-      }
-    }
-    elt.innerHTML = `<em>${indent}working...</em>`;
-    let message = await optimizeCode(imports, code_region, line, context);
-    if (!message) {
-      elt.innerHTML = "";
-      return;
-    }
-    // Canonicalize newlines
-    message = message.replace(new RegExp("\r?\n", "g"), "\n");
-    // Indent every line and format it
-    const formattedCode = message
-      .split("\n")
-      .map(
-        (line) =>
-          indent + Prism.highlight(line, Prism.languages.python, "python"),
-      )
-      .join("<br />");
-    // Display the proposed optimization, with click-to-copy functionality.
-    elt.innerHTML = `<hr><span title="click to copy" style="cursor: copy" id="opt-${file_number}-${line.lineno}">${formattedCode}</span>`;
-    thisElt = document.getElementById(`opt-${file_number}-${line.lineno}`);
-    thisElt.addEventListener("click", async (e) => {
-      await copyOnClick(e, message);
-      // After copying, briefly change the cursor back to the default to provide some visual feedback..
-      thisElt.style = "cursor: auto";
-      await new Promise((resolve) => setTimeout(resolve, 125));
-      thisElt.style = "cursor: copy";
-    });
-  })();
-}
-
-async function copyOnClick(event, message) {
-  event.preventDefault();
-  event.stopPropagation();
-  await navigator.clipboard.writeText(message);
-}
-
-function memory_consumed_str(size_in_mb) {
-  // Return a string corresponding to amount of memory consumed.
-  let gigabytes = Math.floor(size_in_mb / 1024);
-  let terabytes = Math.floor(gigabytes / 1024);
-  if (terabytes > 0) {
-    return `${(size_in_mb / 1048576).toFixed(0)}T`;
-  } else if (gigabytes > 0) {
-    return `${(size_in_mb / 1024).toFixed(0)}G`;
-  } else {
-    return `${size_in_mb.toFixed(0)}M`;
-  }
-}
-
-function time_consumed_str(time_in_ms) {
-  let hours = Math.floor(time_in_ms / 3600000);
-  let minutes = Math.floor((time_in_ms % 3600000) / 60000);
-  let seconds = Math.floor((time_in_ms % 60000) / 1000);
-  let hours_exact = time_in_ms / 3600000;
-  let minutes_exact = (time_in_ms % 3600000) / 60000;
-  let seconds_exact = (time_in_ms % 60000) / 1000;
-  if (hours > 0) {
-    return `${hours.toFixed(0)}h:${minutes_exact.toFixed(
-      0,
-    )}m:${seconds_exact.toFixed(3)}s`;
-  } else if (minutes >= 1) {
-    return `${minutes.toFixed(0)}m:${seconds_exact.toFixed(3)}s`;
-  } else if (seconds >= 1) {
-    return `${seconds_exact.toFixed(3)}s`;
-  } else {
-    return `${time_in_ms.toFixed(0)}ms`;
-  }
-}
-
-function makeTooltip(title, value) {
-    // Tooltip for time bars, below
-    let secs = value / 100 * globalThis.profile.elapsed_time_sec;
-    return `(${title}) ` + value.toFixed(1) + "%" + " [" + time_consumed_str(secs * 1e3) + "]"
-}
-
-function makeBar(python, native, system, params) {
-  // Make a time bar
-  const widthThreshold1 = 20;
-  const widthThreshold2 = 10;
-  // console.log(`makeBar ${python} ${native} ${system}`);
-  return {
-    $schema: "https://vega.github.io/schema/vega-lite/v5.json",
-    config: {
-      view: {
-        stroke: "transparent",
-      },
-    },
-    autosize: {
-      contains: "padding",
-    },
-    width: params.width,
-    height: params.height,
-    padding: 0,
-    data: {
-      values: [
-        {
-          x: 0,
-          y: python.toFixed(1),
-          c: makeTooltip("Python", python),
-          d:
-            python >= widthThreshold1
-              ? python.toFixed(0) + "%"
-              : python >= widthThreshold2
-                ? python.toFixed(0)
-                : "",
-          q: python / 2,
-        },
-        {
-          x: 0,
-          y: native.toFixed(1),
-          c: makeTooltip("native", native),
-          d:
-            native >= widthThreshold1
-              ? native.toFixed(0) + "%"
-              : native >= widthThreshold2
-                ? native.toFixed(0)
-                : "",
-          q: python + native / 2,
-        },
-        {
-          x: 0,
-          y: system.toFixed(1),
-          c: makeTooltip("system", system),
-          d:
-            system >= widthThreshold1
-              ? system.toFixed(0) + "%"
-              : system >= widthThreshold2
-                ? system.toFixed(0)
-                : "",
-          q: python + native + system / 2,
-        },
-      ],
-    },
-    layer: [
-      {
-        mark: { type: "bar" },
-        encoding: {
-          x: {
-            aggregate: "sum",
-            field: "y",
-            axis: false,
-            stack: "zero",
-            scale: { domain: [0, 100] },
-          },
-          color: {
-            field: "c",
-            type: "nominal",
-            legend: false,
-            scale: { range: ["darkblue", "#6495ED", "blue"] },
-          },
-          tooltip: [{ field: "c", type: "nominal", title: "time" }],
-        },
-      },
-      {
-        mark: {
-          type: "text",
-          align: "center",
-          baseline: "middle",
-          dx: 0,
-        },
-        encoding: {
-          x: {
-            aggregate: "sum",
-            field: "q",
-            axis: false,
-          },
-          text: { field: "d" },
-          color: { value: "white" },
-          tooltip: [{ field: "c", type: "nominal", title: "time" }],
-        },
-      },
-    ],
-  };
-}
-
-
-function makeGPUPie(util, gpu_device, params) {
-  return {
-    $schema: "https://vega.github.io/schema/vega-lite/v5.json",
-    config: {
-      view: {
-        stroke: "transparent",
-      },
-    },
-    autosize: {
-      contains: "padding",
-    },
-    width: 30,
-    height: 20,
-    padding: 0,
-    data: {
-      values: [
-        {
-          category: 1,
-          value: util.toFixed(1),
-          c: "in use: " + util.toFixed(1) + "%",
-        },
-      ],
-    },
-    mark: "arc",
-    encoding: {
-      theta: {
-        field: "value",
-        type: "quantitative",
-        scale: { domain: [0, 100] },
-      },
-      color: {
-        field: "c",
-        type: "nominal",
-        legend: false,
-        scale: { range: ["goldenrod", "#f4e6c2"] },
-      },
-      tooltip: [{ field: "c", type: "nominal", title: gpu_device }],
-    },
-  };
-}
-
-function makeGPUBar(util, gpu_device, params) {
-  return {
-    $schema: "https://vega.github.io/schema/vega-lite/v5.json",
-    config: {
-      view: {
-        stroke: "transparent",
-      },
-    },
-    autosize: {
-      contains: "padding",
-    },
-    width: params.width,
-    height: params.height,
-    padding: 0,
-    data: {
-      values: [
-        {
-            x: 0,
-            y: util.toFixed(0),
-	    q: (util / 2).toFixed(0),
-	    d: util >= 20 ? util.toFixed(0) + "%" : "",
-	    dd: "in use: " + util.toFixed(0) + "%",
-        },
-      ],
-    },
-    layer: [
-      {
-        mark: { type: "bar" },
-        encoding: {
-          x: {
-            aggregate: "sum",
-            field: "y",
-            axis: false,
-            scale: { domain: [0, 100] },
-          },
-          color: {
-            field: "dd",
-            type: "nominal",
-            legend: false,
-            scale: { range:  ["goldenrod", "#f4e6c2"] },
-          },
-          tooltip: [{ field: "dd", type: "nominal", title: gpu_device + ":" } ],
-        },
-      },
-      {
-        mark: {
-          type: "text",
-          align: "center",
-          baseline: "middle",
-            dx: 0,
-        },
-        encoding: {
-          x: {
-            aggregate: "sum",
-            field: "q",
-            axis: false,
-          },
-          text: { field: "d" },
-          color: { value: "white" },
-          tooltip: [{ field: "dd", type: "nominal", title: gpu_device + ":" } ],
-        },
-      },
-    ],
-  };
-}
-
-function makeMemoryPie(native_mem, python_mem, params) {
-  return {
-    $schema: "https://vega.github.io/schema/vega-lite/v5.json",
-    width: params.width,
-    height: 20,
-    padding: 0,
-    data: {
-      values: [
-        {
-          category: 1,
-          value: native_mem.toFixed(1),
-          c: "native: " + native_mem.toFixed(1) + "%",
-        },
-        {
-          category: 2,
-          value: python_mem.toFixed(1),
-          c: "Python: " + python_mem.toFixed(1) + "%",
-        },
-      ],
-    },
-    mark: "arc",
-    encoding: {
-      theta: {
-        field: "value",
-        type: "quantitative",
-        scale: { domain: [0, 100] },
-      },
-      color: {
-        field: "c",
-        type: "nominal",
-        legend: false,
-        scale: { range: ["darkgreen", "#50C878"] },
-      },
-      tooltip: [{ field: "c", type: "nominal", title: "memory" }],
-    },
-  };
-}
-
-function makeMemoryBar(memory, title, python_percent, total, color, params) {
-  return {
-    $schema: "https://vega.github.io/schema/vega-lite/v5.json",
-    config: {
-      view: {
-        stroke: "transparent",
-      },
-    },
-    autosize: {
-      contains: "padding",
-    },
-    width: params.width,
-    height: params.height,
-    padding: 0,
-    data: {
-      values: [
-        {
-          x: 0,
-          y: python_percent * memory,
-          c: "(Python) " + memory_consumed_str(python_percent * memory),
-          d:
-            python_percent * memory > total * 0.2
-              ? memory_consumed_str(python_percent * memory)
-              : "",
-          q: (python_percent * memory) / 2,
-        },
-        {
-          x: 0,
-          y: (1.0 - python_percent) * memory,
-          c: "(native) " + memory_consumed_str((1.0 - python_percent) * memory),
-          d:
-            (1.0 - python_percent) * memory > total * 0.2
-              ? memory_consumed_str((1.0 - python_percent) * memory)
-              : "",
-          q: python_percent * memory + ((1.0 - python_percent) * memory) / 2,
-        },
-      ],
-    },
-    layer: [
-      {
-        mark: { type: "bar" },
-        encoding: {
-          x: {
-            aggregate: "sum",
-            field: "y",
-            axis: false,
-            scale: { domain: [0, total] },
-          },
-          color: {
-            field: "c",
-            type: "nominal",
-            legend: false,
-            scale: { range: [color, "#50C878", "green"] },
-          },
-          // tooltip: [{ field: "c", type: "nominal", title: title }],
-        },
-      },
-      {
-        mark: {
-          type: "text",
-          align: "center",
-          baseline: "middle",
-          dx: 0,
-        },
-        encoding: {
-          x: {
-            aggregate: "sum",
-            field: "q",
-            axis: false,
-          },
-          text: { field: "d" },
-          color: { value: "white" },
-        },
-      },
-    ],
-  };
-}
-
-function makeSparkline(samples, max_x, max_y, leak_velocity = 0, params) {
-  const values = samples.map((v, i) => {
-    let leak_str = "";
-    if (leak_velocity != 0) {
-      leak_str = `; possible leak (${memory_consumed_str(leak_velocity)}/s)`;
-    }
-    return {
-      x: v[0],
-      y: v[1],
-      y_text:
-        memory_consumed_str(v[1]) +
-        " (@ " +
-        time_consumed_str(v[0] / 1e6) +
-        ")" +
-        leak_str,
-    };
-  });
-  let leak_info = "";
-  if (leak_velocity != 0) {
-    leak_info = "possible leak";
-    params.height -= 10; // FIXME should be actual height of font
-  }
-
-  const strokeWidth = 1; // 0.25;
-  return {
-    $schema: "https://vega.github.io/schema/vega-lite/v5.json",
-    data: { values: values },
-    width: params.width,
-    height: params.height,
-    padding: 0,
-    title: {
-      text: leak_info,
-      baseline: "line-bottom",
-      color: "red",
-      offset: 0,
-      lineHeight: 10,
-      orient: "bottom",
-      fontStyle: "italic",
-    },
-    encoding: {
-      x: {
-        field: "x",
-        type: "quantitative",
-        title: "",
-        axis: {
-          tickCount: 10,
-          tickSize: 0,
-          labelExpr: "",
-        },
-        scale: {
-          domain: [0, max_x],
-        },
-      },
-    },
-    layer: [
-      {
-        encoding: {
-          y: {
-            field: "y",
-            type: "quantitative",
-            axis: null,
-            scale: {
-              domain: [0, max_y],
-            },
-          },
-          color: {
-            field: "c",
-            type: "nominal",
-            legend: null,
-            scale: {
-              range: ["darkgreen"],
-            },
-          },
-        },
-
-        layer: [
-          { mark: "line" },
-          {
-            transform: [{ filter: { param: "hover", empty: false } }],
-            mark: "point",
-          },
-        ],
-      },
-
-      {
-        mark: "rule",
-        encoding: {
-          opacity: {
-            condition: { value: 0.3, param: "hover", empty: false },
-            value: 0,
-          },
-          tooltip: [{ field: "y_text", type: "nominal", title: "memory" }],
-        },
-        params: [
-          {
-            name: "hover",
-            select: {
-              type: "point",
-              fields: ["y"],
-              nearest: true,
-              on: "mousemove",
-            },
-          },
-        ],
-      },
-    ],
-  };
-}
-
 const CPUColor = "blue";
 const MemoryColor = "green";
 const CopyColor = "goldenrod";
 let columns = [];
+
+function stringLines(lines) {
+    const docstringLines = new Set();
+
+    let inDocstring = false;      // Are we currently inside a docstring?
+    let docstringDelimiter = null; // Either `'''` or `"""` when in a docstring.
+
+    for (let i = 0; i < lines.length; i++) {
+	const line = lines[i];
+	let searchIndex = 0;
+	// We'll record if we were already in a docstring at the start of this line.
+	let wasInDocstring = inDocstring;
+
+	// Repeatedly look for triple quotes in the current line.
+	while (true) {
+	    // Find the next occurrence of either `'''` or `"""`.
+	    const nextTripleSingle = line.indexOf("'''", searchIndex);
+	    const nextTripleDouble = line.indexOf('"""', searchIndex);
+
+	    // Figure out which one occurs first (if either).
+	    let nextIndex = -1;
+	    let foundDelimiter = null;
+
+	    if (nextTripleSingle !== -1 && (nextTripleDouble === -1 || nextTripleSingle < nextTripleDouble)) {
+		nextIndex = nextTripleSingle;
+		foundDelimiter = "'''";
+	    } else if (nextTripleDouble !== -1 && (nextTripleSingle === -1 || nextTripleDouble < nextTripleSingle)) {
+		nextIndex = nextTripleDouble;
+		foundDelimiter = '"""';
+	    }
+
+	    // If no further triple quotes found in this line, break out of the loop.
+	    if (nextIndex === -1) {
+		break;
+	    }
+
+	    // Advance searchIndex so that subsequent searches move past this point.
+	    searchIndex = nextIndex + 3;
+
+	    // Toggle logic if we've found a triple quote.
+	    if (!inDocstring) {
+		// Not in a docstring, so this starts one.
+		inDocstring = true;
+		docstringDelimiter = foundDelimiter;
+	    } else {
+		// Already in a docstring, check if it matches our current delimiter.
+		if (docstringDelimiter === foundDelimiter) {
+		    // This ends our current docstring.
+		    inDocstring = false;
+		    docstringDelimiter = null;
+		}
+	    }
+	}
+
+	// If we were in a docstring at any point during this line, mark it.
+	// (If wasInDocstring was true at the start or inDocstring is true now,
+	//  it means this line is part of a docstring.)
+	if (wasInDocstring || inDocstring) {
+	    docstringLines.add(i);
+	}
+    }
+    return docstringLines;
+}
 
 function makeTableHeader(fname, gpu, gpu_device, memory, params) {
   let tableTitle;
@@ -1302,13 +172,13 @@ function makeTableHeader(fname, gpu, gpu_device, memory, params) {
       title: [gpu_device, "util."],
       color: CopyColor,
       width: 0,
-	info: `% utilization of ${gpu_device} by line / function (may be inaccurate if ${gpu_device} is not dedicated)`,
+      info: `% utilization of ${gpu_device} by line / function (may be inaccurate if ${gpu_device} is not dedicated)`,
     });
     columns.push({
       title: [gpu_device, "memory"],
       color: CopyColor,
       width: 0,
-	info: `Peak ${gpu_device} memory allocated by line / function (may be inaccurate if ${gpu_device} is not dedicated)`,
+      info: `Peak ${gpu_device} memory allocated by line / function (may be inaccurate if ${gpu_device} is not dedicated)`,
     });
   }
   columns.push({ title: ["", ""], color: "black", width: 100 });
@@ -1349,16 +219,16 @@ function makeTableHeader(fname, gpu, gpu_device, memory, params) {
 
 function hideEmptyProfiles() {
   const elts = document.getElementsByClassName("empty-profile");
-  for (elt of elts) {
-    s = elt.style;
+  for (const elt of elts) {
+    const s = elt.style;
     s.display = "none";
   }
 }
 
-function toggleReduced() {
+export function toggleReduced() {
   const elts = document.getElementsByClassName("empty-profile");
-  for (elt of elts) {
-    s = elt.style;
+  for (const elt of elts) {
+    const s = elt.style;
     if (s.display == "") {
       s.display = "none";
     } else {
@@ -1369,6 +239,7 @@ function toggleReduced() {
 
 function makeProfileLine(
   line,
+  inDocstring,
   filename,
   file_number,
   prof,
@@ -1389,7 +260,7 @@ function makeProfileLine(
     lineno < line.end_region_line;
     lineno++
   ) {
-    currline = prof["files"][filename]["lines"][lineno];
+    const currline = prof["files"][filename]["lines"][lineno];
     total_region_time +=
       currline.n_cpu_percent_python +
       currline.n_cpu_percent_c +
@@ -1466,7 +337,7 @@ function makeProfileLine(
         line.n_cpu_percent_python,
         line.n_cpu_percent_c,
         line.n_sys_percent,
-          { height: 20, width: 100 },
+        { height: 20, width: 100 },
       ),
     );
   } else {
@@ -1567,20 +438,25 @@ function makeProfileLine(
       s += `<td style="width: 50; vertical-align: middle" align="right" data-sort="${line.n_gpu_percent}">`;
       s += `<span style="height: 20; width: 30; vertical-align: middle" id="gpu_pie${gpu_pies.length}"></span>`;
       s += "</td>";
-      gpu_pies.push(makeGPUPie(line.n_gpu_percent, prof.gpu_device, { height: 20, width: 100 }));
+      gpu_pies.push(
+        makeGPUPie(line.n_gpu_percent, prof.gpu_device, {
+          height: 20,
+          width: 30,
+        }),
+      );
       // gpu_pies.push(makeGPUBar(line.n_gpu_percent, prof.gpu_device, { height: 20, width: 100 }));
     }
     if (true) {
       if (line.n_gpu_peak_memory_mb < 1.0 || line.n_gpu_percent < 1.0) {
         s += '<td style="width: 100"></td>';
       } else {
-	  let mem = line.n_gpu_peak_memory_mb;
-	  let memStr = "MB";
-	  if (mem >= 1024) {
-	      mem /= 1024;
-	      memStr = "GB";
-	  }
-          s += `<td style="width: 100; vertical-align: middle" align="right"><font style="font-size: small" color="${CopyColor}">${mem.toFixed(0)}${memStr}&nbsp;&nbsp;</font></td>`;
+        let mem = line.n_gpu_peak_memory_mb;
+        let memStr = "MB";
+        if (mem >= 1024) {
+          mem /= 1024;
+          memStr = "GB";
+        }
+        s += `<td style="width: 100; vertical-align: middle" align="right"><font style="font-size: small" color="${CopyColor}">${mem.toFixed(0)}${memStr}&nbsp;&nbsp;</font></td>`;
       }
     }
   }
@@ -1606,7 +482,6 @@ function makeProfileLine(
 
   // Convert back any escaped Unicode.
   line.line = unescapeUnicode(line.line);
-
   const codeLine = Prism.highlight(line.line, Prism.languages.python, "python");
   s += `<td style="height:10" align="left" bgcolor="whitesmoke" style="vertical-align: middle" data-sort="${line.lineno}">`;
   let newLine = structuredClone(line);
@@ -1615,7 +490,7 @@ function makeProfileLine(
     // Construct a new line corresponding to this region.
     let mb_copied = 0;
     for (let lineno = start_region_line; lineno < end_region_line; lineno++) {
-      currline = prof["files"][filename]["lines"][lineno];
+      const currline = prof["files"][filename]["lines"][lineno];
       mb_copied += currline.n_copy_mb * prof.elapsed_time_sec;
       newLine.n_cpu_percent_python += currline.n_cpu_percent_python;
       newLine.n_cpu_percent_c += currline.n_cpu_percent_c;
@@ -1648,21 +523,26 @@ function makeProfileLine(
   } else {
     s += lineOptimizationString;
   }
-  s += `<pre style="height: 10; display: inline; white-space: pre-wrap; overflow-x: auto; border: 0px; vertical-align: middle"><code class="language-python ${empty_profile}">${codeLine}<span id="code-${file_number}-${line.lineno}" bgcolor="white"></span></code></pre></td>`;
+  // If we are in a docstring, format it as such in the <span>
+  let optionalInDocstring = "";
+  if (inDocstring) {
+      optionalInDocstring = "token comment";
+  }
+    s += `<pre style="height: 10; display: inline; white-space: pre-wrap; overflow-x: auto; border: 0px; vertical-align: middle"><code class="language-python ${optionalInDocstring} ${empty_profile}">${codeLine}<span id="code-${file_number}-${line.lineno}" bgcolor="white"></span></code></pre></td>`;
   s += "</tr>";
   return s;
 }
 
 // Track all profile ids so we can collapse and expand them en masse.
-let allIDs = [];
+let allIds = [];
 
-function collapseAll() {
+export function collapseAll() {
   for (const id of allIds) {
     collapseDisplay(id);
   }
 }
 
-function expandAll() {
+export function expandAll() {
   for (const id of allIds) {
     expandDisplay(id);
   }
@@ -1680,7 +560,7 @@ function expandDisplay(id) {
   document.getElementById(`button-${id}`).innerHTML = DownTriangle;
 }
 
-function toggleDisplay(id) {
+export function toggleDisplay(id) {
   const d = document.getElementById(`profile-${id}`);
   if (d.style.display == "block") {
     d.style.display = "none";
@@ -1725,18 +605,13 @@ async function display(prof) {
     toggleServiceFields();
   }
 
-  // Restore the old GPU toggle from local storage (if any).
-  const gpu_checkbox = document.getElementById("use-gpu-checkbox");
-  old_gpu_checkbox = window.localStorage.getItem("use-gpu-checkbox");
-  if (old_gpu_checkbox) {
-    if (gpu_checkbox.checked.toString() != old_gpu_checkbox) {
-      gpu_checkbox.click();
-    }
-  } else {
-    // Set the GPU checkbox on if the profile indicated the presence of a GPU.
-    if (gpu_checkbox.checked != prof.gpu) {
-      gpu_checkbox.click();
-    }
+  const gpu_checkbox = document.getElementById("use-gpu-checkbox") || "";
+  // Set the GPU checkbox on if the profile indicated the presence of a GPU.
+  if (gpu_checkbox.checked != prof.gpu) {
+    gpu_checkbox.click();
+  }
+  if (prof.gpu) {
+    document.getElementById("accelerator-name").innerHTML = prof.gpu_device;
   }
   globalThis.profile = prof;
   let memory_sparklines = [];
@@ -1789,7 +664,6 @@ async function display(prof) {
   let cpu_native = 0;
   let cpu_system = 0;
   let mem_python = 0;
-  let mem_native = 0;
   let max_alloc = 0;
   let cp = {};
   let cn = {};
@@ -1924,11 +798,18 @@ async function display(prof) {
     s += `<div style="${displayStr}" id="profile-${id}">`;
     s += `<table class="profile table table-hover table-condensed" id="table-${tableID}">`;
     tableID++;
-      s += makeTableHeader(ff[0], prof.gpu, prof.gpu_device, prof.memory, { functions: false });
+    s += makeTableHeader(ff[0], prof.gpu, prof.gpu_device, prof.memory, {
+      functions: false,
+    });
     s += "<tbody>";
+    // Compute all docstring lines
+    const linesArray = ff[1].lines.map(entry => entry.line);
+    const docstringLines = stringLines(linesArray);
     // Print per-line profiles.
     let prevLineno = -1;
+    let index = -1;
     for (const l in ff[1].lines) {
+      index += 1;
       const line = ff[1].lines[l];
 
       if (false) {
@@ -1950,6 +831,7 @@ async function display(prof) {
       prevLineno = line.lineno;
       s += makeProfileLine(
         line,
+        docstringLines.has(index),
         ff[0],
         fileIteration,
         prof,
@@ -1966,13 +848,16 @@ async function display(prof) {
     // Print out function summaries.
     if (prof.files[ff[0]].functions.length) {
       s += `<table class="profile table table-hover table-condensed" id="table-${tableID}">`;
-	s += makeTableHeader(ff[0], prof.gpu, prof.gpu_device, prof.memory, { functions: true });
+      s += makeTableHeader(ff[0], prof.gpu, prof.gpu_device, prof.memory, {
+        functions: true,
+      });
       s += "<tbody>";
       tableID++;
       for (const l in prof.files[ff[0]].functions) {
         const line = prof.files[ff[0]].functions[l];
         s += makeProfileLine(
           line,
+          false,  
           ff[0],
           fileIteration,
           prof,
@@ -2007,7 +892,7 @@ async function display(prof) {
       `F${escape(ff[0])}-nonline`,
     );
     for (let i = 0; i < allHeaders.length; i++) {
-      allHeaders[i].addEventListener("click", (e) => {
+      allHeaders[i].addEventListener("click", () => {
         const all = document.getElementsByClassName(
           `F${escape(ff[0])}-blankline`,
         );
@@ -2022,7 +907,7 @@ async function display(prof) {
   for (const ff of files) {
     document
       .getElementById(`${escape(ff[0])}-lineProfile`)
-      .addEventListener("click", (e) => {
+      .addEventListener("click", () => {
         const all = document.getElementsByClassName(
           `F${escape(ff[0])}-blankline`,
         );
@@ -2047,34 +932,22 @@ async function display(prof) {
       })();
     }
   });
-  cpu_bars.forEach((p, index) => {
-    if (p) {
-      (async () => {
-        await vegaEmbed(`#cpu_bar${index}`, p, { actions: false });
-      })();
-    }
-  });
-  gpu_pies.forEach((p, index) => {
-    if (p) {
-      (async () => {
-        await vegaEmbed(`#gpu_pie${index}`, p, { actions: false });
-      })();
-    }
-  });
-  memory_activity.forEach((p, index) => {
-    if (p) {
-      (async () => {
-        await vegaEmbed(`#memory_activity${index}`, p, { actions: false });
-      })();
-    }
-  });
-  memory_bars.forEach((p, index) => {
-    if (p) {
-      (async () => {
-        await vegaEmbed(`#memory_bar${index}`, p, { actions: false });
-      })();
-    }
-  });
+
+  function embedCharts(charts, prefix) {
+    charts.forEach((chart, index) => {
+      if (chart) {
+        (async () => {
+          await vegaEmbed(`#${prefix}${index}`, chart, { actions: false });
+        })();
+      }
+    });
+  }
+
+  embedCharts(cpu_bars, "cpu_bar");
+  embedCharts(gpu_pies, "gpu_pie");
+  embedCharts(memory_activity, "memory_activity");
+  embedCharts(memory_bars, "memory_bar");
+
   // Hide all empty profiles by default.
   hideEmptyProfiles();
   if (prof.program) {
@@ -2084,7 +957,7 @@ async function display(prof) {
   }
 }
 
-function load(profile) {
+export function load(profile) {
   (async () => {
     // let resp = await fetch(jsonFile);
     // let prof = await resp.json();
@@ -2092,7 +965,7 @@ function load(profile) {
   })();
 }
 
-function loadFetch() {
+export function loadFetch() {
   (async () => {
     let resp = await fetch("profile.json");
     let profile = await resp.json();
@@ -2100,7 +973,7 @@ function loadFetch() {
   })();
 }
 
-function loadFile() {
+export function loadFile() {
   const input = document.getElementById("fileinput");
   const file = input.files[0];
   const fr = new FileReader();
@@ -2114,12 +987,12 @@ function doSomething(e) {
   load(profile);
 }
 
-function loadDemo() {
+export function loadDemo() {
   load(example_profile);
 }
 
 // JavaScript function to toggle fields based on selected service
-function toggleServiceFields() {
+export function toggleServiceFields() {
   let service = document.getElementById("service-select").value;
   window.localStorage.setItem("scalene-service-select", service);
   document.getElementById("openai-fields").style.display =
@@ -2137,28 +1010,6 @@ function revealInstallMessage() {
   document.getElementById("local-models-list").style.display = "none";
 }
 
-async function fetchModelNames() {
-  try {
-    const local_ip = document.getElementById("local-ip").value;
-    const local_port = document.getElementById("local-port").value;
-    const response = await fetch(`http://${local_ip}:${local_port}/api/tags`);
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    const data = await response.json();
-
-    // Extracting the model names
-    const modelNames = data.models.map((model) => model.name);
-    if (modelNames.length === 0) {
-      revealInstallMessage();
-    }
-    return modelNames;
-  } catch (error) {
-    console.error("Error fetching model names:", error);
-    revealInstallMessage();
-    return [];
-  }
-}
 
 function createSelectElement(modelNames) {
   // Create the select element
@@ -2181,7 +1032,9 @@ function createSelectElement(modelNames) {
 }
 
 function replaceDivWithSelect() {
-  fetchModelNames().then((modelNames) => {
+    const local_ip = document.getElementById("local-ip").value;
+    const local_port = document.getElementById("local-port").value;
+    fetchModelNames(local_ip, local_port, revealInstallMessage).then((modelNames) => {
     // Create the select element with options
     const selectElement = createSelectElement(modelNames);
 
@@ -2193,78 +1046,13 @@ function replaceDivWithSelect() {
     } else {
       console.error('Div with ID "language-local-models" not found.');
     }
-    atLeastOneModel = true;
-  });
-}
-
-function restoreState(el) {
-  const savedValue = localStorage.getItem(el.id);
-
-  if (savedValue !== null) {
-    switch (el.type) {
-      case "checkbox":
-      case "radio":
-        el.checked = savedValue === "true";
-        break;
-      default:
-        el.value = savedValue;
-        break;
-    }
-  }
-}
-
-function saveState(el) {
-  el.addEventListener("change", () => {
-    switch (el.type) {
-      case "checkbox":
-      case "radio":
-        localStorage.setItem(el.id, el.checked);
-        break;
-      default:
-        localStorage.setItem(el.id, el.value);
-        break;
-    }
-  });
-}
-
-// Process all DOM elements in the class 'persistent', which saves their state in localStorage and restores them on load.
-function processPersistentElements() {
-  const persistentElements = document.querySelectorAll(".persistent");
-
-  // Restore state
-  persistentElements.forEach((el) => {
-    restoreState(el);
-  });
-
-  // Save state
-  persistentElements.forEach((el) => {
-    saveState(el);
+    //    atLeastOneModel = true;
   });
 }
 
 // Call the function to replace the div with the select element
 replaceDivWithSelect();
 
-// Handle updating persistence when the DOM is updated.
-const observeDOM = () => {
-  const observer = new MutationObserver((mutations) => {
-    mutations.forEach((mutation) => {
-      if (mutation.addedNodes) {
-        mutation.addedNodes.forEach((node) => {
-          if (node.nodeType === 1 && node.matches(".persistent")) {
-            restoreState(node);
-            node.addEventListener("change", () => saveState(node));
-          }
-        });
-      }
-    });
-  });
-
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-  });
-};
 
 document.addEventListener("DOMContentLoaded", () => {
   processPersistentElements();
@@ -2280,5 +1068,9 @@ function sendHeartbeat() {
   xhr.open("GET", "/heartbeat", true);
   xhr.send();
 }
+
+window.addEventListener("load", () => {
+  load(profile);
+});
 
 setInterval(sendHeartbeat, 10000); // Send heartbeat every 10 seconds
